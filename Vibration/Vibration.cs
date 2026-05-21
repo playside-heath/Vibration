@@ -150,9 +150,12 @@ namespace Vibrations
                         {
                             foreach (var preset in settings.AndroidEventDurations)
                             {
+                                int amplitude = preset.Value.Strength < 0f
+                                    ? -1
+                                    : Mathf.RoundToInt(Mathf.Clamp01(preset.Value.Strength) * 255);
                                 cachedJNIValues[preset.Key] = new CachedValues()
                                 {
-                                    oneShot = GetPointer(AndroidJNIHelper.CreateJNIArgArray(new object[] { Vibration.vibrationEffect.CallStatic<AndroidJavaObject>("createOneShot", preset.Value.DurationMS, Mathf.RoundToInt(preset.Value.Strength * 255)) }))
+                                    oneShot = GetPointer(AndroidJNIHelper.CreateJNIArgArray(new object[] { Vibration.vibrationEffect.CallStatic<AndroidJavaObject>("createOneShot", preset.Value.DurationMS, amplitude) }))
                                 };
                             }
                         }
@@ -234,7 +237,8 @@ namespace Vibrations
                 await UniTask.Delay(_delayMs);
             }
         }
-
+        
+        
         #region IOS specific methods
 
         public static void VibrateIOS(ImpactFeedbackStyle style)
@@ -285,27 +289,26 @@ namespace Vibrations
         /// <param name="_intensity"></param>
         static unsafe void VibrateWithIntensityAndroid(UnityEngine.jvalue* _milliseconds, UnityEngine.jvalue* _oneShot)
         {
-            if (Application.isMobilePlatform)
+            if (Application.isMobilePlatform && currentActivity != null && vibratorPtr != IntPtr.Zero)
             {
-                if (Vibration.AndroidVersion >= 26)
+                // JNI object refs embedded in cached jvalue arrays were created on the Android UI /
+                // Unity main thread; calling Vibrator through JNIEnv on another thread corrupts ART.
+                void InvokeOnUiThread()
                 {
-                    new Thread(() =>
+                    try
                     {
-                        try
-                        {
-                            int threadJoinState = AndroidJNI.AttachCurrentThread();
+                        if (Vibration.AndroidVersion >= 26)
                             AndroidJNI.CallVoidMethodUnsafe(Vibration.vibratorPtr, vibrateEffectMethodID, _oneShot);
-                        }
-                        catch (System.Exception e)
-                        {
-                            UnityEngine.Debug.LogException(e);
-                        }
-                    }).Start();
+                        else
+                            AndroidJNI.CallVoidMethodUnsafe(Vibration.vibratorPtr, vibrateMethodID, _milliseconds);
+                    }
+                    catch (System.Exception e)
+                    {
+                        UnityEngine.Debug.LogException(e);
+                    }
                 }
-                else
-                {
-                    AndroidJNI.CallVoidMethodUnsafe(Vibration.vibratorPtr, vibrateMethodID, _milliseconds);
-                }
+
+                currentActivity.Call("runOnUiThread", new AndroidJavaRunnable(InvokeOnUiThread));
             }
         }
 #endif
