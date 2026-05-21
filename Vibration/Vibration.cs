@@ -66,13 +66,17 @@ namespace Vibrations
 
         public static AndroidJavaClass vibrationEffect;
 
-        private static ConcurrentQueue<System.Action> playHapticsQueue = new ConcurrentQueue<Action>();
         private static Dictionary<ImpactFeedbackStyle, CachedValues> cachedJNIValues = new Dictionary<ImpactFeedbackStyle, CachedValues>();
 
         struct CachedValues
         {
             public unsafe UnityEngine.jvalue* oneShot;
             public unsafe UnityEngine.jvalue* oneShotMs;
+            /// <summary>
+            /// JNI global ref for the cached <see cref="VibrationEffect"/> (API 26+ only).
+            /// Kept so the ref is valid across threads / envs once promoted from the local returned by createOneShot.
+            /// </summary>
+            public IntPtr oneShotEffectGlobalRef;
         }
 #endif
 
@@ -104,9 +108,6 @@ namespace Vibrations
             };
         }
 
-        // Cache the method ID
-        private static IntPtr runOnUiThreadMethodID = IntPtr.Zero;
-
         private static IntPtr vibrateMethodID = IntPtr.Zero;
         private static IntPtr vibrateEffectMethodID = IntPtr.Zero;
 
@@ -125,10 +126,24 @@ namespace Vibrations
         {
             if (initialized) return;
 
+            // Setup android version
+            androidVersion = 0;
+            if (Application.platform == RuntimePlatform.Android)
+            {
+                string androidVersionStr = SystemInfo.operatingSystem;
+                int sdkPos = androidVersionStr.IndexOf("API-");
+                androidVersion = int.Parse(androidVersionStr.Substring(sdkPos + 4, 2).ToString());
+            }
+            
+            platform = Application.platform;
+            isMobilePlatform = Application.isMobilePlatform;
+            
             settings ??= new Settings();
 
+            AndroidJNIHelper.debug = true;
+
 #if UNITY_ANDROID
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 
                 unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
@@ -142,7 +157,7 @@ namespace Vibrations
                     vibrationEffect = new AndroidJavaClass("android.os.VibrationEffect");
                 }
 
-                if (Application.isMobilePlatform)
+                if (isMobilePlatform)
                 {
                     if (Vibration.AndroidVersion >= 26)
                     {
@@ -153,9 +168,28 @@ namespace Vibrations
                                 int amplitude = preset.Value.Strength < 0f
                                     ? -1
                                     : Mathf.RoundToInt(Mathf.Clamp01(preset.Value.Strength) * 255);
+                                using var oneShotLocal = Vibration.vibrationEffect.CallStatic<AndroidJavaObject>("createOneShot", preset.Value.DurationMS, amplitude);
+                                IntPtr localRef = oneShotLocal.GetRawObject();
+                                if (localRef == IntPtr.Zero)
+                                {
+                                    Debug.LogWarning($"Vibration preset {preset.Key}: createOneShot returned null JNI ref.");
+                                    continue;
+                                }
+
+                                IntPtr globalRef = AndroidJNI.NewGlobalRef(localRef);
+                                if (globalRef == IntPtr.Zero)
+                                {
+                                    Debug.LogWarning($"Vibration preset {preset.Key}: AndroidJNI.NewGlobalRef failed.");
+                                    continue;
+                                }
+
+                                UnityEngine.jvalue[] oneShotJNIArgs = new UnityEngine.jvalue[1];
+                                oneShotJNIArgs[0].l = globalRef;
+
                                 cachedJNIValues[preset.Key] = new CachedValues()
                                 {
-                                    oneShot = GetPointer(AndroidJNIHelper.CreateJNIArgArray(new object[] { Vibration.vibrationEffect.CallStatic<AndroidJavaObject>("createOneShot", preset.Value.DurationMS, amplitude) }))
+                                    oneShot = GetPointer(oneShotJNIArgs),
+                                    oneShotEffectGlobalRef = globalRef
                                 };
                             }
                         }
@@ -191,18 +225,6 @@ namespace Vibrations
                             "(J)V"
                         );
                     }
-
-                    if (runOnUiThreadMethodID == IntPtr.Zero)
-                    {
-                        runOnUiThreadMethodID = AndroidJNIHelper.GetMethodID(
-                            Vibration.currentActivity.GetRawClass(),
-                            "runOnUiThread",
-                            "(Ljava/lang/Runnable;)V"
-                        );
-                    }
-
-                    // Start thread to process android haptics.
-                    new Thread(ProcessAndroidHapticsQueue).Start();
                 }
             }
 #endif
@@ -270,18 +292,6 @@ namespace Vibrations
 
 #if UNITY_ANDROID
 
-        private static void ProcessAndroidHapticsQueue()
-        {
-            AndroidJNI.AttachCurrentThread();
-            while (true)
-            {
-                while (playHapticsQueue.TryDequeue(out Action callback))
-                    callback?.Invoke();
-
-                Thread.Sleep(1);
-            }
-        }
-
         /// <summary>
         /// Custom vibration that lets us pick intensity
         /// </summary>
@@ -289,7 +299,7 @@ namespace Vibrations
         /// <param name="_intensity"></param>
         static unsafe void VibrateWithIntensityAndroid(UnityEngine.jvalue* _milliseconds, UnityEngine.jvalue* _oneShot)
         {
-            if (Application.isMobilePlatform && currentActivity != null && vibratorPtr != IntPtr.Zero)
+            if (isMobilePlatform && currentActivity != null && vibratorPtr != IntPtr.Zero)
             {
                 // JNI object refs embedded in cached jvalue arrays were created on the Android UI /
                 // Unity main thread; calling Vibrator through JNIEnv on another thread corrupts ART.
@@ -297,10 +307,14 @@ namespace Vibrations
                 {
                     try
                     {
-                        if (Vibration.AndroidVersion >= 26)
+                        if (AndroidVersion >= 26)
+                        {
                             AndroidJNI.CallVoidMethodUnsafe(Vibration.vibratorPtr, vibrateEffectMethodID, _oneShot);
+                        }
                         else
+                        {
                             AndroidJNI.CallVoidMethodUnsafe(Vibration.vibratorPtr, vibrateMethodID, _milliseconds);
+                        }
                     }
                     catch (System.Exception e)
                     {
@@ -328,7 +342,7 @@ namespace Vibrations
         public static void VibratePop()
         {
             if (!IsAvailable()) return;
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 #if UNITY_IOS
             _VibratePop ();
@@ -346,7 +360,7 @@ namespace Vibrations
         public static void VibratePeek()
         {
             if (!IsAvailable()) return;
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 #if UNITY_IOS
             _VibratePeek ();
@@ -364,7 +378,7 @@ namespace Vibrations
         public static async Task VibrateNope()
         {
             if (!IsAvailable()) return;
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 #if UNITY_IOS
             _VibrateNope ();
@@ -394,7 +408,7 @@ namespace Vibrations
         public static void VibrateAndroid(long milliseconds)
         {
             if (!IsAvailable()) return;
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
                 if (AndroidVersion >= 26)
                 {
@@ -415,7 +429,7 @@ namespace Vibrations
         public static void VibrateAndroid(long[] pattern, int repeat)
         {
             if (!IsAvailable()) return;
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
                 if (AndroidVersion >= 26)
                 {
@@ -436,7 +450,7 @@ namespace Vibrations
         ///</summary>
         public static void CancelAndroid()
         {
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 #if UNITY_ANDROID
                 vibrator.Call("cancel");
@@ -448,7 +462,7 @@ namespace Vibrations
 
         public static bool HasVibrator()
         {
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
 #if UNITY_WEBGL
             return true;
@@ -486,30 +500,26 @@ namespace Vibrations
         {
             if (!IsAvailable()) return;
 #if UNITY_ANDROID || UNITY_IOS
-            if (Application.isMobilePlatform)
+            if (isMobilePlatform)
             {
                 Handheld.Vibrate();
             }
 #elif UNITY_WEBGL
-            if ( Application.isMobilePlatform ) {
+            if ( isMobilePlatform ) {
                 VibrateWebgl ( 1 );
             }
 #endif
         }
 
+        private static int androidVersion;
+        private static RuntimePlatform platform;
+        private static bool isMobilePlatform;
+        
         public static int AndroidVersion
         {
             get
             {
-                int iVersionNumber = 0;
-                if (Application.platform == RuntimePlatform.Android)
-                {
-                    string androidVersion = SystemInfo.operatingSystem;
-                    int sdkPos = androidVersion.IndexOf("API-");
-                    iVersionNumber = int.Parse(androidVersion.Substring(sdkPos + 4, 2).ToString());
-                }
-
-                return iVersionNumber;
+                return androidVersion;
             }
         }
 
