@@ -452,6 +452,9 @@ namespace Vibrations
 #endif
 #if UNITY_ANDROID
 
+                if (context == null)
+                    return false;
+                
                 AndroidJavaClass contextClass = new AndroidJavaClass("android.content.Context");
                 string Context_VIBRATOR_SERVICE = contextClass.GetStatic<string>("VIBRATOR_SERVICE");
                 AndroidJavaObject systemService = context.Call<AndroidJavaObject>("getSystemService", Context_VIBRATOR_SERVICE);
